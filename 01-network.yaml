@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Ephemeral Rocket.Chat event - Network stack.
+  VPC with public + private subnets, IGW, route tables, EC2 Instance Connect
+  Endpoint (EICE) in a private subnet, and security groups. No SSM endpoints,
+  no NAT (NAT is a separate, disposable stack). Region: us-east-1.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ephemeral-rocketchat
+    Description: Prefix used for resource names and exports.
+
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.20.0.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.20.1.0/24
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.20.10.0/24
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.20.11.0/24
+
+  AzA:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+    Description: First AZ. Avoid us-east-1e (use1-az3), which does not support CloudFront VPC origins.
+
+  AzB:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+    Description: Second AZ. Avoid us-east-1e (use1-az3).
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # VPC + Internet Gateway
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-igw"
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------------------------
+  # Subnets
+  # ---------------------------------------------------------------------------
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Ref AzA
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-a"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Ref AzB
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-b"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Ref AzA
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-a"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Ref AzB
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-b"
+
+  # ---------------------------------------------------------------------------
+  # Route tables
+  # ---------------------------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-public-rt"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private route table is created here WITHOUT a 0.0.0.0/0 route.
+  # The NAT stack adds (and on delete removes) the default route into it,
+  # so NAT can be created/destroyed independently without touching this stack.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-rt"
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # Security groups
+  # ---------------------------------------------------------------------------
+  # EICE security group: outbound SSH (22) to the EC2 instance SG only.
+  EiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the EC2 Instance Connect Endpoint
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          DestinationSecurityGroupId: !Ref InstanceSecurityGroup
+          Description: SSH to Rocket.Chat EC2 instance
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-eice-sg"
+
+  # EC2 instance security group.
+  # Inbound 80 only from the CloudFront managed prefix list (VPC origin traffic),
+  # and 22 only from the EICE security group (on-demand SSH).
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Rocket.Chat EC2 instance
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-instance-sg"
+
+  InstanceIngressFromCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !Ref CloudFrontOriginPrefixList
+      Description: HTTP from CloudFront (VPC origin)
+
+  InstanceIngressSshFromEice:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      SourceSecurityGroupId: !Ref EiceSecurityGroup
+      Description: SSH from EC2 Instance Connect Endpoint
+
+  InstanceEgressAll:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: "-1"
+      CidrIp: 0.0.0.0/0
+      Description: Allow all outbound (needs NAT stack present to reach the internet)
+
+  # ---------------------------------------------------------------------------
+  # Managed prefix list lookup for CloudFront's origin-facing IP ranges
+  # (com.amazonaws.global.cloudfront.origin-facing)
+  # ---------------------------------------------------------------------------
+  CloudFrontOriginPrefixList:
+    Type: Custom::CloudFrontPrefixList
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: describe-prefix-lists
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeManagedPrefixLists
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Resolve the CloudFront origin-facing managed prefix list ID
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "cf-origin-pl")
+                      return
+                  ec2 = boto3.client("ec2")
+                  resp = ec2.describe_managed_prefix_lists(
+                      Filters=[{
+                          "Name": "prefix-list-name",
+                          "Values": ["com.amazonaws.global.cloudfront.origin-facing"],
+                      }]
+                  )
+                  pls = resp.get("PrefixLists", [])
+                  if not pls:
+                      cfnresponse.send(event, context, cfnresponse.FAILED,
+                                       {"Reason": "CloudFront origin-facing prefix list not found"},
+                                       "cf-origin-pl")
+                      return
+                  pl_id = pls[0]["PrefixListId"]
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"PrefixListId": pl_id}, pl_id)
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {"Reason": str(e)}, "cf-origin-pl")
+
+  # ---------------------------------------------------------------------------
+  # EC2 Instance Connect Endpoint (no extra charge). Placed in private subnet A.
+  # ---------------------------------------------------------------------------
+  InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref EiceSecurityGroup
+      PreserveClientIp: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-eice"
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub "${ProjectName}-VpcId"
+
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub "${ProjectName}-PublicSubnet1Id"
+
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub "${ProjectName}-PublicSubnet2Id"
+
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub "${ProjectName}-PrivateSubnet1Id"
+
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub "${ProjectName}-PrivateSubnet2Id"
+
+  PrivateRouteTableId:
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub "${ProjectName}-PrivateRouteTableId"
+
+  InstanceSecurityGroupId:
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub "${ProjectName}-InstanceSecurityGroupId"
+
+  InstanceConnectEndpointId:
+    Value: !Ref InstanceConnectEndpoint
+    Export:
+      Name: !Sub "${ProjectName}-InstanceConnectEndpointId"

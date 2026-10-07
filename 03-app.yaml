@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Ephemeral Rocket.Chat event - App stack.
+  EC2 (t8i.medium, Ubuntu 24.04) in a private subnet running Rocket.Chat +
+  MongoDB via Docker Compose, fronted by a CloudFront distribution using a
+  VPC origin (default *.cloudfront.net domain only; ACM + custom domain are
+  added manually after deploy). Region: us-east-1.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ProjectName
+    Description: Must match the ProjectName used in the network stack.
+
+  InstanceType:
+    Type: String
+    Default: t8i.medium
+
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Resolves to the latest Ubuntu 24.04 (Noble) x86_64 AMI.
+
+  RocketChatVersion:
+    Type: String
+    Default: 7.4.0
+    Description: Rocket.Chat image tag to deploy.
+
+# Must be changed.
+  RootUrl:
+    Type: String
+    Default: https://<Domain Name>
+    Description: Public URL users hit (CloudFront + custom domain). Used as Rocket.Chat ROOT_URL.
+
+  RootVolumeSizeGb:
+    Type: Number
+    Default: 20
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 bucket serving the "preparing" error page (error.html).
+  # Private; readable only by this CloudFront distribution via OAC. Used as a
+  # fallback origin so the page shows even when the EC2 origin is stopped.
+  # ---------------------------------------------------------------------------
+  ErrorPageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-errorpage-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-errorpage"
+
+  ErrorPageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ErrorPageBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${ErrorPageBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  ErrorPageOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-errorpage-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------------
+  # IAM role for the instance (minimal: EC2 Instance Connect pushes ephemeral
+  # keys over the EICE tunnel; no SSM agent connectivity is required).
+  # ---------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-instance-role"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ---------------------------------------------------------------------------
+  # EC2 instance running Rocket.Chat + MongoDB via Docker Compose
+  # ---------------------------------------------------------------------------
+  RocketChatInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref UbuntuAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      # Burstable (T-family) default is "unlimited"; pin to "standard" so a
+      # sustained CPU spike can never incur surplus credit charges.
+      CreditSpecification:
+        CPUCredits: standard
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnet1Id"
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub "${ProjectName}-InstanceSecurityGroupId"
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGb
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-rocketchat"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # Install Docker Engine + Compose plugin (official convenience script).
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          curl -fsSL https://get.docker.com | sh
+          systemctl enable --now docker
+
+          # Rocket.Chat deployment directory.
+          install -d -m 0755 /opt/rocketchat
+          cd /opt/rocketchat
+
+          cat > compose.yml <<'YAML'
+          services:
+            rocketchat:
+              image: registry.rocket.chat/rocketchat/rocket.chat:${RocketChatVersion}
+              restart: unless-stopped
+              environment:
+                MONGO_URL: "mongodb://mongodb:27017/rocketchat?replicaSet=rs0"
+                MONGO_OPLOG_URL: "mongodb://mongodb:27017/local?replicaSet=rs0"
+                ROOT_URL: "${RootUrl}"
+                PORT: "3000"
+                DEPLOY_METHOD: docker
+              depends_on:
+                mongodb:
+                  condition: service_healthy
+              ports:
+                # CloudFront VPC origin talks HTTP to port 80 on the instance.
+                - "80:3000"
+
+            mongodb:
+              image: mongo:7.0
+              restart: unless-stopped
+              command: >-
+                mongod --replSet rs0 --bind_ip_all
+              volumes:
+                - mongodb_data:/data/db
+              healthcheck:
+                test:
+                  - CMD
+                  - bash
+                  - -c
+                  - >-
+                    mongosh --quiet --eval
+                    'try{rs.status().ok}catch(e){rs.initiate({_id:"rs0",members:[{_id:0,host:"mongodb:27017"}]}).ok}'
+                interval: 10s
+                timeout: 10s
+                retries: 30
+                start_period: 20s
+
+          volumes:
+            mongodb_data: {}
+          YAML
+
+          # Start the stack.
+          docker compose -f /opt/rocketchat/compose.yml up -d
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Function (viewer-request) used only during maintenance.
+  # A cache behavior only picks WHICH ORIGIN a request goes to; it does NOT
+  # rewrite the path, and DefaultRootObject applies only to "/". So to make an
+  # arbitrary path like /channel/general show the preparing page, rocket.sh
+  # attaches this function to the maintenance /* behavior; it rewrites every
+  # request URI to /error.html.
+  # ---------------------------------------------------------------------------
+  MaintenanceRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      AutoPublish: true
+      Name: !Sub "${ProjectName}-maintenance-rewrite"
+      FunctionConfig:
+        Comment: Rewrite every request URI to /error.html during maintenance.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            request.uri = '/error.html';
+            return request;
+        }
+
+  # ---------------------------------------------------------------------------
+  # CloudFront VPC origin -> EC2 instance (HTTP :80 in the private subnet)
+  # ---------------------------------------------------------------------------
+  VpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${ProjectName}-vpc-origin"
+        Arn: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${RocketChatInstance}"
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc-origin"
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} Rocket.Chat"
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: rocketchat-vpc-origin
+            DomainName: !GetAtt RocketChatInstance.PrivateDnsName
+            VpcOriginConfig:
+              VpcOriginId: !Ref VpcOrigin
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+          # Fallback origin: S3 bucket serving the "preparing" error page.
+          - Id: errorpage-s3-origin
+            DomainName: !GetAtt ErrorPageBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt ErrorPageOac.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: rocketchat-vpc-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed "CachingDisabled" policy (chat is fully dynamic).
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed "AllViewerExceptHostHeader" policy forwards all headers
+          # (incl. WebSocket Upgrade/Connection), cookies and query strings.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CacheBehaviors:
+          # Serve /error.html from S3 so it works even when EC2 is stopped.
+          - PathPattern: /error.html
+            TargetOriginId: errorpage-s3-origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            # Managed "CachingOptimized" policy.
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          # EC2 stopped -> CloudFront gets 502/503/504 -> show the page as 200.
+          - ErrorCode: 502
+            ResponseCode: 200
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 503
+            ResponseCode: 200
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 504
+            ResponseCode: 200
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 10
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID (use with EC2 Instance Connect Endpoint to SSH in).
+    Value: !Ref RocketChatInstance
+
+  CloudFrontDomainName:
+    Description: >-
+      CloudFront default domain. Point Domain Name here
+      (Route 53 alias) AFTER adding the ACM cert + alternate domain name.
+    Value: !GetAtt Distribution.DomainName
+
+  CloudFrontDistributionId:
+    Value: !Ref Distribution
+
+  ErrorPageBucketName:
+    Description: Upload error.html here (aws s3 cp error.html s3://<bucket>/).
+    Value: !Ref ErrorPageBucket
+
+  MaintenanceFunctionArn:
+    Description: >-
+      ARN of the maintenance CloudFront Function. rocket.sh stop attaches it
+      (as a viewer-request association) to the /* behavior so every path is
+      rewritten to /error.html during maintenance.
+    Value: !GetAtt MaintenanceRewriteFunction.FunctionARN

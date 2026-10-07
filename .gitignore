@@ -1,0 +1,12 @@
+# Blog draft (not part of the published project)
+blog.md
+
+# Agent workflow artifacts
+.agents/
+
+# macOS
+.DS_Store
+
+# Editor / local
+*.swp
+*~
