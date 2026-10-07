@@ -31,15 +31,27 @@ Parameters:
     Type: String
     Default: 10.20.11.0/24
 
+  # NOTE: CloudFront VPC origins are not supported in the Availability Zone
+  # whose AZ ID is use1-az3. AZ *names* (us-east-1a, -1b, ...) map to AZ *IDs*
+  # (use1-az1, use1-az2, ...) differently per account, so you cannot tell from
+  # the name alone which one is use1-az3. Check YOUR account's mapping first:
+  #   aws ec2 describe-availability-zones --region us-east-1 \
+  #     --query "AvailabilityZones[].[ZoneName,ZoneId]" --output table
+  # then pass two AZ names that are NOT mapped to use1-az3. The defaults below
+  # are only a starting point and may be wrong for your account.
   AzA:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1a
-    Description: First AZ. Avoid us-east-1e (use1-az3), which does not support CloudFront VPC origins.
+    Description: >-
+      First AZ (name). Must NOT map to AZ ID use1-az3 in your account
+      (CloudFront VPC origins are unsupported there). Verify with
+      "aws ec2 describe-availability-zones".
 
   AzB:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1b
-    Description: Second AZ. Avoid us-east-1e (use1-az3).
+    Description: >-
+      Second AZ (name). Must also NOT map to AZ ID use1-az3 in your account.
 
 Resources:
   # ---------------------------------------------------------------------------

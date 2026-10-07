@@ -23,8 +23,10 @@ Parameters:
 
   RocketChatVersion:
     Type: String
-    Default: 7.4.0
-    Description: Rocket.Chat image tag to deploy.
+    Default: 8.9.0
+    Description: >-
+      Rocket.Chat image tag to deploy. 8.x requires MongoDB 8.0 (see the
+      mongodb service below) and ships Node.js 24 in the official image.
 
 # Must be changed.
   RootUrl:
@@ -170,7 +172,8 @@ Resources:
                 - "80:3000"
 
             mongodb:
-              image: mongo:7.0
+              # Rocket.Chat 8.x requires MongoDB 8.0.
+              image: mongo:8.0
               restart: unless-stopped
               command: >-
                 mongod --replSet rs0 --bind_ip_all

@@ -128,7 +128,7 @@ aws cloudformation describe-stacks \
 
 `example.com` ホストゾーンに:
 
-- レコード名: `ephemeral-rocketchat`
+- レコード名: `chat`（`chat.example.com` になる）
 - タイプ: `A`（エイリアス ON）
 - エイリアス先: CloudFront ディストリビューション（A で確認したドメイン）
 
@@ -253,7 +253,7 @@ aws cloudformation delete-stack --region us-east-1 --stack-name ephemeral-rocket
 
 手動で作ったものも忘れずに削除してください:
 
-- Route 53: `ephemeral-rocketchat` の A(エイリアス) レコード、および ACM の CNAME 検証レコード
+- Route 53: `chat`（`chat.example.com`）の A(エイリアス) レコード、および ACM の CNAME 検証レコード
 - ACM: 発行した証明書（us-east-1）
 
 > ネットワークスタックの削除は、アプリスタック削除で CloudFront の VPC オリジン用 ENI が消えてからでないと失敗することがあります。上記の順序（app → nat → network）と `wait` を守ってください。
@@ -263,7 +263,13 @@ aws cloudformation delete-stack --region us-east-1 --stack-name ephemeral-rocket
 ## 補足メモ
 
 - `t8i.medium` は 2 vCPU / 4 GiB。Rocket.Chat + MongoDB の最小ラインです。
-- サブネットは `us-east-1a` / `us-east-1b` を既定にしています（CloudFront VPC オリジン非対応の `use1-az3` を回避）。別AZにしたい場合は `01-network.yaml` の `AzA` / `AzB` を変更。
+- サブネットは AZ **名**（`us-east-1a` / `us-east-1b`）を既定にしていますが、これは出発点にすぎません。CloudFront VPC オリジンが非対応なのは AZ **ID** が `use1-az3` の AZ です。AZ 名（`us-east-1a` など）と AZ ID（`use1-az1` など）の対応は**アカウントごとに異なる**ため、名前だけでは `use1-az3` かどうか判断できません（[AWS: AZ ID について](https://docs.aws.amazon.com/ram/latest/userguide/working-with-az-ids.html)）。デプロイ前に自分のアカウントの対応を確認し、`use1-az3` に割り当たっていない AZ 名を `01-network.yaml` の `AzA` / `AzB` に指定してください:
+
+  ```bash
+  aws ec2 describe-availability-zones --region us-east-1 \
+    --query "AvailabilityZones[].[ZoneName,ZoneId]" --output table
+  # ZoneId が use1-az3 の行の ZoneName を避けて、2つの ZoneName を選ぶ
+  ```
 - 検証コマンド: `cfn-lint -r us-east-1 -i W1030 -- 01-network.yaml 02-nat.yaml 03-app.yaml`
   （`W1030` は cfn-lint の内蔵スペックが新しい `t8i` を未収録なだけの誤検知。EC2 API で実在を確認済み。）
 
