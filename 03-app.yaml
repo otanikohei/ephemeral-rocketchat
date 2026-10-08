@@ -9,7 +9,7 @@ Description: >-
 Parameters:
   ProjectName:
     Type: String
-    Default: ProjectName
+    Default: ephemeral-rocketchat
     Description: Must match the ProjectName used in the network stack.
 
   InstanceType:
@@ -172,9 +172,17 @@ Resources:
                 - "80:3000"
 
             mongodb:
-              # Rocket.Chat 8.x requires MongoDB 8.0.
-              image: mongo:8.0
+              # Rocket.Chat 8.x requires MongoDB 8.0+. We use 8.2 because
+              # MongoDB 8.0.x refuses to start on Linux kernel 6.19-7.0.13
+              # (TCMalloc/rseq incompatibility, SERVER-121912), and the latest
+              # Ubuntu 24.04 AMI now ships such a kernel. 8.2 does not block
+              # startup on these kernels.
+              image: mongo:8.2
               restart: unless-stopped
+              # Disable glibc rseq so TCMalloc does not hit the rseq ABI bug
+              # that underlies the kernel 6.19+ incompatibility.
+              environment:
+                GLIBC_TUNABLES: "glibc.pthread.rseq=0"
               command: >-
                 mongod --replSet rs0 --bind_ip_all
               volumes:

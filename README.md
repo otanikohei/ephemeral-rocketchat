@@ -5,9 +5,9 @@
 ## 構成
 
 ```
-ユーザー
+やること
   → chat.example.com  (Route 53 Alias ← 手動で後付け)
-  → CloudFront  (ACM証明書 + 独自ドメイン ← 手動で後付け / HTTPS終端 / WebSocket許可 / キャッシュ無効)
+  → CloudFront (ACM証明書 + 独自ドメイン ← 手動で後付け / HTTPS終端 / WebSocket許可 / キャッシュ無効)
   → VPC Origin (HTTP:80)
   → EC2 t8i.medium (プライベートサブネット, Ubuntu 24.04)
        └ Docker Compose: Rocket.Chat + MongoDB(レプリカセット)
@@ -19,21 +19,29 @@
 ```
 
 - **リージョン**: `us-east-1`
-- EC2 はプライベートサブネット。CloudFront だけが 80 番に到達可能（CloudFront マネージドプレフィックスリストで制限）。
-- SSH が必要なときだけ **EC2 Instance Connect Endpoint (EICE)** 経由。EICE は追加料金なし。
-- SSM の VPC エンドポイントは**使わない**（課金回避）。
-- NAT ゲートウェイは**別スタック**。Docker イメージ取得後に削除して課金を止められる。
+- EC2 はプライベートサブネットに起動します
+- CloudFront VPC Origin を採用しています
+- CloudFront マネージドプレフィックスリスト `com.amazonaws.global.cloudfront.origin-facing` で制限しているので、CloudFront のみ 80 番に到達可能です
+  - VPC Origin への inbound 許可には 2 通りあります
+  - (1) このマネージドプレフィックスリストを許可する方法と、(2) VPC Origin 作成後に自動生成される CloudFront のサービス管理 SG `CloudFront-VPCOrigins-Service-SG` を許可する方法です
+  - 本構成は **(1) を採用** しています。
+  - (2) は「自分の distribution からのみ」に絞れてより限定的ですが、**SG が VPC Origin 作成後にしか存在しない**ため 1 スタックで完結させにくく、デプロイ順に依存しない (1) を選びました
+- SSH が必要なときだけ **EC2 Instance Connect Endpoint (EIC Endpoint)** 経由で接続します
+- EIC Endpoint は追加料金がかかりません
+- SSM の VPC エンドポイントは課金を回避するために **使いません**。
+- NAT ゲートウェイは **別スタック** にしました
+- Docker イメージ取得後に削除して課金を止める想定です
 
 ### スタック構成とファイル
 
 | 順序 | ファイル | 役割 | 寿命 |
 |---|---|---|---|
-| 1 | `01-network.yaml` | VPC・サブネット・IGW・ルートテーブル・EICE・SG | 常設（安い） |
-| 2 | `02-nat.yaml` | NAT Gateway + EIP + プライベートRTへの既定ルート | **使い捨て**（高い） |
-| 3 | `03-app.yaml` | EC2(Rocket.Chat) + CloudFront(VPCオリジン) + S3(準備中ページ) | イベント期間 |
+| 1 | `01-network.yaml` | VPC・サブネット・IGW・ルートテーブル・EIC Endpoint・SG | 常設（安価） |
+| 2 | `02-nat.yaml` | NAT Gateway + EIP + プライベート RT への既定ルート | **使い捨て**（高額） |
+| 3 | `03-app.yaml` | EC2 (Rocket.Chat) + CloudFront (VPC Origin) + S3 (Sorry ページ) | イベント期間 |
 | - | `error.html` | 停止中に表示する準備中ページ（S3 にアップロード） | - |
 
-`ProjectName` パラメータ（既定 `ephemeral-rocketchat`）は3スタックで**同じ値**を使ってください。スタック間は Export/ImportValue で連携します。
+`ProjectName` パラメータ（既定 `ephemeral-rocketchat`）は 3 スタックで **同じ値** を使ってください。スタック間は Export/ImportValue で連携します。
 
 ---
 
@@ -51,7 +59,8 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM
 ```
 
-> `01-network.yaml` は CloudFront のオリジン向けプレフィックスリスト ID を解決する小さな Lambda（カスタムリソース）を含むため `CAPABILITY_IAM` が必要です。
+> `01-network.yaml` は CloudFront のオリジン向けプレフィックスリスト ID を解決する小さな Lambda（カスタムリソース）を含むため `CAPABILITY_IAM` が必要です
+> `EC2 Instance Connect Endpoint` の作成に時間がかかります
 
 ### 2. NAT スタック（イメージ取得のため一時的に作成）
 
@@ -62,23 +71,30 @@ aws cloudformation deploy \
   --template-file 02-nat.yaml
 ```
 
-### 3. アプリスタック（EC2 + CloudFront）
+> これをデプロイしないと、`03-app-yaml` 実行時に、Rocket.Chat のデプロイに失敗します。
+> Rocket.Chat のセットアップが完了したら、削除できます。
+
+### 3. アプリスタック
+
+EC2 や CloudFront などをデプロイします。
 
 ```bash
 aws cloudformation deploy \
   --region us-east-1 \
   --stack-name ephemeral-rocketchat-app \
   --template-file 03-app.yaml \
-  --capabilities CAPABILITY_IAM
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides RootUrl=https://chat.example.com
 ```
 
-- `UbuntuAmiId` は SSM パラメータで最新の Ubuntu 24.04 を自動解決します。
-- `RocketChatVersion`（既定 `7.4.0`）や `RootUrl` を変えたいときは `--parameter-overrides Key=Value` を付けてください。
-- CloudFront ディストリビューションと VPC オリジンのデプロイは**最大15分**ほどかかります。
+- `UbuntuAmiId` は SSM パラメータで最新の Ubuntu 24.04 を自動解決します
+- `RocketChatVersion` や `RootUrl` を変えたいときは `--parameter-overrides Key=Value` を付けてください
+- CloudFront ディストリビューションと VPC オリジンのデプロイは **最大15分** ほどかかります
 
 ### 4. 起動確認
 
-アプリスタック作成後、EC2 内で Docker が起動するまで数分かかります。確認したいときは EICE 経由で SSH:
+アプリスタック作成後、EC2 内で Docker が起動するまで数分かかります。  
+確認したいときは EIC Endpoint 経由で SSH してください。
 
 ```bash
 # InstanceId はアプリスタックの出力に出る
@@ -98,7 +114,46 @@ Rocket.Chat が `Server is running on port 3000` 相当のログを出せば OK 
 
 ## デプロイ後の手動作業（HTTPS + 独自ドメイン）
 
-CloudFront はまず**デフォルトドメイン（`xxxx.cloudfront.net`）のみ**で立ち上がります。ここに独自ドメインと証明書を手で足します。
+CloudFront はまず　**デフォルトドメイン（`xxxx.cloudfront.net`）のみ**　で立ち上がります。　　
+ここに独自ドメインと証明書を手で足します。
+
+独自ドメインが不要な方は、下記「A〜D」をスキップし、代わりに次の「CloudFront のデフォルトドメインをそのまま使う場合」を実施してください。
+
+### CloudFront のデフォルトドメインをそのまま使う場合（独自ドメイン不要）
+
+独自ドメイン・ACM 証明書・Route 53 は不要です。CloudFront の `*.cloudfront.net` ドメインに直接アクセスします。ただし Rocket.Chat は、`ROOT_URL` を**そのデフォルトドメインに合わせる**必要があり、`ROOT_URL` が `アクセスする URL` と食い違うと、ログインや WebSocket が正しく動きません。
+
+デフォルトドメインはデプロイ後にしか分からないため、次の 2 段階で設定します。
+
+1. まず `RootUrl` を仮の値（例: `https://example.com`）でデプロイし (3. アプリスタック参照)、CloudFront のデフォルトドメインを確認する:
+
+   ```bash
+   # 払い出されたデフォルトドメインを確認するコマンド
+   aws cloudformation describe-stacks \
+     --region us-east-1 --stack-name ephemeral-rocketchat-app \
+     --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDomainName'].OutputValue" --output text
+
+   # 例: d1234abcd.cloudfront.net といったドメインが返る
+   ```
+
+2. 確認したデフォルトドメインを `RootUrl` に入れて再 deploy する（`https://` を付ける）:
+
+   ```bash
+   aws cloudformation deploy \
+     --region us-east-1 \
+     --stack-name ephemeral-rocketchat-app \
+     --template-file 03-app.yaml \
+     --capabilities CAPABILITY_IAM \
+     --parameter-overrides RootUrl=https://d1234abcd.cloudfront.net
+   ```
+
+   > `RootUrl` だけが変わる更新なので、CloudFront ディストリビューション自体は作り直されません。EC2 の `ROOT_URL` を反映するためインスタンスの入れ替え（または再起動）が発生する場合があります。
+
+反映後、`https://d1234abcd.cloudfront.net`（自分の値）にアクセスするとセットアップウィザードが表示されます。管理者アカウントを作成して完了です。
+
+> この構成では独自ドメインを一切使わないので、後述の「⚠️ 重要: 03 を再 deploy するとカスタムドメインが外れる」は該当しません（手動で足すカスタムドメインが無いため、再 deploy で崩れるものがありません）。
+
+---
 
 ### A. CloudFront ドメインを確認
 
