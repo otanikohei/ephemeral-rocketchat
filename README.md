@@ -1,26 +1,56 @@
-# Ephemeral Rocket.Chat on AWS
+# 🚀 Ephemeral Rocket.Chat on AWS
 
 イベント当日だけ使う Rocket.Chat を、EC2 + CloudFront VPC オリジンで立てるための CloudFormation 一式です。**イベント後は全スタックを削除**してください（下記「後片付け」）。
 
-## 構成
+## アーキテクチャ
+
+![システム構成図](./images/system-architecture.png)
+
+- Amazon Route 53
+  - 名前解決と ACM 証明書発行に利用します
+- Amaazon CloudFront
+  - Amazon EC2 と Sorry Page のメンテナンス画面を配信します
+- CloudFront VPC Origin
+  - HTTP:80 でプライベートサブネットに起動した EC2 に接続します
+- Amazon EC2
+  - 最新の t8i インスタンスを採用しました
+  - Rocket.Chat と MongoDB を稼働させます
+- NAT Gateway
+  - Rocket.Chat の Docker イメージ取得などのためインターネット接続を提供します
+  - セットアップ完了後に削除できます
+- Amazon Route 53 と AWS Certificate Manager
+  - 独自ドメインを利用する際に使います (オプション)
+
+## セットアップ手順
+
+セットアップ時のみ NAT Gateway が必要です。  
+セットアップが終わったら、NAT Gateway は削除できます。
 
 ```
 やること
-  → chat.example.com  (Route 53 Alias ← 手動で後付け)
-  → CloudFront (ACM証明書 + 独自ドメイン ← 手動で後付け / HTTPS終端 / WebSocket許可 / キャッシュ無効)
-  → VPC Origin (HTTP:80)
-  → EC2 t8i.medium (プライベートサブネット, Ubuntu 24.04)
-       └ Docker Compose: Rocket.Chat + MongoDB(レプリカセット)
 
-  ※ メンテ中は rocket.sh が /* ビヘイビア + viewer-request Function を追加し、
-     全 URI を /error.html に書き換えて S3 の準備中ページを返す
-     → S3 バケット (OAC で CloudFront からのみ読取可) / 準備中ページ
-     ※ 502/503/504 のカスタムエラーレスポンスはバックストップとして併存
+1. CloudFormation の 3 スタックを流す
+2. Rocket.Chat をセットアップする
+3. NAT Gateway を削除する
+4. Error ページを編集して S3 にアップロードする
+
+[オプション] 独自ドメインをつけたい場合は、別途、ドメインとホストゾーンが必要です。
+
+5. Route 53 に CloudFront のエイリアスレコードを設定
+6. ACM 証明書を発行
+7. CloudFront に Route 53 レコードを手動で紐づけ
+
+Rocket.Chat をセットアップして NAT Gateway を削除し、サーバーを止める
+
+8. Rocket.Chat に、匿名書き込みを許可するなどのセットアップをする
+9. rocket.sh を使ってサーバーを止める
 ```
 
-- **リージョン**: `us-east-1`
+### そのほか留意事項
+
+- **リージョン**は、`us-east-1` を利用します
 - EC2 はプライベートサブネットに起動します
-- CloudFront VPC Origin を採用しています
+- CloudFront VPC Origin をデプロイします
 - CloudFront マネージドプレフィックスリスト `com.amazonaws.global.cloudfront.origin-facing` で制限しているので、CloudFront のみ 80 番に到達可能です
   - VPC Origin への inbound 許可には 2 通りあります
   - (1) このマネージドプレフィックスリストを許可する方法と、(2) VPC Origin 作成後に自動生成される CloudFront のサービス管理 SG `CloudFront-VPCOrigins-Service-SG` を許可する方法です
@@ -31,6 +61,9 @@
 - SSM の VPC エンドポイントは課金を回避するために **使いません**。
 - NAT ゲートウェイは **別スタック** にしました
 - Docker イメージ取得後に削除して課金を止める想定です
+- Rocket.Chat のバージョンは、現行最新の 8.9.0 を採用しました
+- Rocket.Chat 8.x に必要な MongoDB をデプロイします
+- Node.js 24 が同梱されます
 
 ### スタック構成とファイル
 
@@ -45,11 +78,14 @@
 
 ---
 
-## デプロイ手順
+## やること詳細 - デプロイ手順
 
-事前確認: `aws sts get-caller-identity` が通ること、リージョンが `us-east-1` であること。
+まず、CloudFormation の 3 スタックを流します。  
+事前確認として `aws sts get-caller-identity` が通ること、リージョンが `us-east-1` であることを確認してください。
 
-### 1. ネットワークスタック
+### 1-1. ネットワークスタックを流す
+
+01-network.yaml を CloudFormarion に流します。
 
 ```bash
 aws cloudformation deploy \
@@ -59,10 +95,12 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM
 ```
 
-> `01-network.yaml` は CloudFront のオリジン向けプレフィックスリスト ID を解決する小さな Lambda（カスタムリソース）を含むため `CAPABILITY_IAM` が必要です
+> `01-network.yaml` は CloudFront のオリジン向けプレフィックスリスト ID を解決する小さな Lambda（カスタムリソース）を含むため `CAPABILITY_IAM` が必要です  
 > `EC2 Instance Connect Endpoint` の作成に時間がかかります
 
-### 2. NAT スタック（イメージ取得のため一時的に作成）
+### 1-2. NAT スタックを流す
+
+NAT Gateway がデプロイされ、プライベートザブネットがインターネットに接続できるようになります。
 
 ```bash
 aws cloudformation deploy \
@@ -74,9 +112,9 @@ aws cloudformation deploy \
 > これをデプロイしないと、`03-app-yaml` 実行時に、Rocket.Chat のデプロイに失敗します。
 > Rocket.Chat のセットアップが完了したら、削除できます。
 
-### 3. アプリスタック
+### 1-3. アプリスタックを流す
 
-EC2 や CloudFront などをデプロイします。
+EC2 や CloudFront などがデプロイされます。
 
 ```bash
 aws cloudformation deploy \
@@ -87,13 +125,13 @@ aws cloudformation deploy \
   --parameter-overrides RootUrl=https://chat.example.com
 ```
 
-- `UbuntuAmiId` は SSM パラメータで最新の Ubuntu 24.04 を自動解決します
-- `RocketChatVersion` や `RootUrl` を変えたいときは `--parameter-overrides Key=Value` を付けてください
+- `UbuntuAmiId` は SSM パラメータで最新の Ubuntu 24.04 を自動解決します  
+- `RocketChatVersion` や `RootUrl` を変えたいときは `--parameter-overrides Key=Value` を付けてください  
 - CloudFront ディストリビューションと VPC オリジンのデプロイは **最大15分** ほどかかります
 
-### 4. 起動確認
+### 2. Rocket.Chat をセットアップする
 
-アプリスタック作成後、EC2 内で Docker が起動するまで数分かかります。  
+アプリスタックを作成した後、EC2 内で Docker が起動するまで数分かかります。  
 確認したいときは EIC Endpoint 経由で SSH してください。
 
 ```bash
@@ -108,92 +146,138 @@ sudo docker compose -f /opt/rocketchat/compose.yml ps
 sudo docker compose -f /opt/rocketchat/compose.yml logs -f rocketchat
 ```
 
-Rocket.Chat が `Server is running on port 3000` 相当のログを出せば OK です。
+Rocket.Chat が `Server is running on port 3000` 相当のログを出せば OK です。  
+Rocket.Chat を最初に開くと、管理者を登録するウィザードが開きます。  
+メールアドレスが必要です。
 
----
+### 3. NAT Gateway を削除する
 
-## デプロイ後の手動作業（HTTPS + 独自ドメイン）
+Docker イメージの取得が終われば、NAT の課金を止めれます。  
+外形からは Rocket.Chat のセットアップ画面が表示されたことが確認できれば問題ありません。  
+CloudFormation スタックを削除してください。
 
-CloudFront はまず　**デフォルトドメイン（`xxxx.cloudfront.net`）のみ**　で立ち上がります。　　
-ここに独自ドメインと証明書を手で足します。
-
-独自ドメインが不要な方は、下記「A〜D」をスキップし、代わりに次の「CloudFront のデフォルトドメインをそのまま使う場合」を実施してください。
-
-### CloudFront のデフォルトドメインをそのまま使う場合（独自ドメイン不要）
-
-独自ドメイン・ACM 証明書・Route 53 は不要です。CloudFront の `*.cloudfront.net` ドメインに直接アクセスします。ただし Rocket.Chat は、`ROOT_URL` を**そのデフォルトドメインに合わせる**必要があり、`ROOT_URL` が `アクセスする URL` と食い違うと、ログインや WebSocket が正しく動きません。
-
-デフォルトドメインはデプロイ後にしか分からないため、次の 2 段階で設定します。
-
-1. まず `RootUrl` を仮の値（例: `https://example.com`）でデプロイし (3. アプリスタック参照)、CloudFront のデフォルトドメインを確認する:
-
-   ```bash
-   # 払い出されたデフォルトドメインを確認するコマンド
-   aws cloudformation describe-stacks \
-     --region us-east-1 --stack-name ephemeral-rocketchat-app \
-     --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDomainName'].OutputValue" --output text
-
-   # 例: d1234abcd.cloudfront.net といったドメインが返る
-   ```
-
-2. 確認したデフォルトドメインを `RootUrl` に入れて再 deploy する（`https://` を付ける）:
-
-   ```bash
-   aws cloudformation deploy \
-     --region us-east-1 \
-     --stack-name ephemeral-rocketchat-app \
-     --template-file 03-app.yaml \
-     --capabilities CAPABILITY_IAM \
-     --parameter-overrides RootUrl=https://d1234abcd.cloudfront.net
-   ```
-
-   > `RootUrl` だけが変わる更新なので、CloudFront ディストリビューション自体は作り直されません。EC2 の `ROOT_URL` を反映するためインスタンスの入れ替え（または再起動）が発生する場合があります。
-
-反映後、`https://d1234abcd.cloudfront.net`（自分の値）にアクセスするとセットアップウィザードが表示されます。管理者アカウントを作成して完了です。
-
-> この構成では独自ドメインを一切使わないので、後述の「⚠️ 重要: 03 を再 deploy するとカスタムドメインが外れる」は該当しません（手動で足すカスタムドメインが無いため、再 deploy で崩れるものがありません）。
-
----
-
-### A. CloudFront ドメインを確認
+EC2・CloudFront はそのまま動き続けます。プライベートサブネットからの外向き通信だけが止まるイメージです。
 
 ```bash
-aws cloudformation describe-stacks \
-  --region us-east-1 --stack-name ephemeral-rocketchat-app \
-  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDomainName'].OutputValue" --output text
-# 例: d1234abcd.cloudfront.net
+aws cloudformation delete-stack --region us-east-1 --stack-name ephemeral-rocketchat-nat
 ```
 
-### B. ACM 証明書を発行（必ず `us-east-1`）
+> 注意: NAT を落とすと Rocket.Chat の外向き通信 （cloud.rocket.chat 登録、モバイルプッシュ通知ゲートウェイ、外部 URL プレビューなど） が使えなくなります。
+> チャット自体のデモには影響しません。再び必要になったら `02-nat.yaml` を再デプロイすればルートが復活します。
 
-1. ACM（バージニア北部）で `chat.example.com` のパブリック証明書をリクエスト（DNS 検証）。
-2. 表示される **CNAME 検証レコード**を Route 53 の `example.com` ホストゾーンに追加（コンソールの「Route 53 でレコードを作成」ボタンでOK）。
-3. 証明書の状態が **発行済み (Issued)** になるまで待つ。
+### 4. Error ページを編集して S3 にアップロードする
 
-### C. CloudFront に独自ドメイン + 証明書を追加
+Error ページは、`error.html` です。  
+XXX などのフレーズを適宜修正して、S3 バケットにアップロードしてください。  
 
-対象ディストリビューション（アプリスタック出力の `CloudFrontDistributionId`）の設定で:
+```bash
+BUCKET=$(aws cloudformation describe-stacks --region us-east-1 \
+  --stack-name ephemeral-rocketchat-app \
+  --query "Stacks[0].Outputs[?OutputKey=='ErrorPageBucketName'].OutputValue" --output text)
 
-- **代替ドメイン名 (CNAME)**: `chat.example.com`
-- **カスタム SSL 証明書**: B で発行した ACM 証明書を選択
+echo $BUCKET
 
-変更を保存し、デプロイ完了（`Deployed`）まで待つ。
+aws s3 cp error.html "s3://$BUCKET/error.html" \
+  --content-type "text/html; charset=utf-8"
+```
 
-### D. Route 53 に本番レコードを追加
+### 5. Route 53 に CloudFront レコードを手動で紐づける
+[オプション 作業]
 
-`example.com` ホストゾーンに:
+スタックのデプロイが終わったら、Route 53 レコードを登録して、手作業にて独自ドメインを設定できます。  
+CloudFront はまず　**デフォルトドメイン（`xxxx.cloudfront.net`）のみ**　で立ち上がるため、ここに独自ドメインと証明書を手で足します。
 
-- レコード名: `chat`（`chat.example.com` になる）
-- タイプ: `A`（エイリアス ON）
-- エイリアス先: CloudFront ディストリビューション（A で確認したドメイン）
+Route 53 にドメインを登録します。Route 53 にホストゾーンが登録されます。  
+ホストゾーンに、レコードを登録します。  
+登録するレコードは以下の通りです。
 
-反映後、`https://chat.example.com` にアクセスするとセットアップウィザードが表示されます。管理者アカウントを作成して完了です。
+- Route 53 ホストゾーンを開き、レコード（例: example.com.）を追加する
+  - エイリアスレコードのトグルを ON にする
+  - CloudFront を選択する
+  - CloudFront の DNS を登録する
 
----
+> 独自ドメインが不要な方は、本作業をスキップして、手順 8 に進んでください
 
-## ⚠️ 重要: 03 を再 deploy するとカスタムドメインが外れる
+### 6. ACM 証明書を発行
+[オプション]
 
-上記 C で**カスタムドメインと ACM 証明書をコンソールで手動設定**した場合、その設定は `03-app.yaml` のテンプレートには**書かれていません**。この状態で `03-app.yaml` をそのまま再 `deploy` すると、CloudFormation が「テンプレートに無い設定＝不要」と判断して、手動で足した **代替ドメイン名と証明書を削除**します。結果 `https://chat.example.com` にアクセスできなくなります。
+AWS Certificate Manager (ACM) を利用することで、独自ドメインに HTTPS 通信を実装できます。  
+手順は以下の通りです。
+
+- ACM を開く
+- バージニア北部リージョンの管理コンソールが開いていることを確認して証明書を登録する
+  - 先の手順で Route 53 に登録したレコード（例: example.com）を入力して、発行する
+  - エクスポート機能は有効にしない（コストがかかります）
+  - Route 53 に CNAME レコードへの書き込みを行う
+- ステータスが検証済みになることを確認する
+
+### 7. CloudFront に Route 53 レコードを手動で紐づけ
+[オプション]
+
+最後に、CloudFront にカスタムドメインを設定したら独自ドメイン設定の作業は完了です。
+
+- CloudFront の一般タブにある [編集] ボタンをクリックする
+- Alternative domain name (CNAMEs) - optional に 4 の手順で発行したレコードの DNS 名を入れる (例: example.com)
+- Custom SSL certificate - optional に 5 の手順で発行した ACM レコードを設定する
+- [変更を保存] ボタンをクリックする
+
+### 8. Rocket.Chat に、匿名書き込みを許可するなどのセットアップをする
+
+ハンズオンイベントなどで Rocket.Chat を複数名で利用する場合、以下の設定変更を検討する必要があります。
+
+#### ログイン不要にする
+
+初期設定では、ログインが必要です。管理者画面から設定を変更することでログインなしでチャットを利用できます。  
+
+- 管理者アカウントで Rocket.Chat にログインする
+- Manage → Workspace → Settings → Accounts に進む
+- Allow Anonymous Read を ON にすると、ログインせずに公開チャンネルを閲覧できる
+- Allow Anonymous Write	を ON にすると、ログインせずに公開チャンネルへ投稿できる
+
+#### Rate Limiter （リクエスト数制限） を解除する
+
+Rocket.Chat には、短時間に大量のリクエストが発生することを防ぐ仕組みがあり、会場の Wi-Fi から一斉にアクセスしたりして制限に達すると、リクエストが拒否される場合があります。  
+Rate Limiter を解除することで全員が囲めるようになります。
+
+- 管理者アカウントで Rocket.Chat にログインする
+- Manage → Workspace → Settings → Rate Limiter に進む
+- 以下の値を調整する
+  - API Rate Limiter で、API リクエストの制限ができます
+  - Limit by IP	で、同一 IP アドレスからのリクエストを制限できます
+  - Limit by Connection で、接続単位の制限ができます
+  - Limit by User で、ユーザー単位の制限ができます
+- CloudFront からの接続が
+
+まずは設定値を記録し、制限に達していないか確認することをおすすめします。
+
+### 9. rocket.sh を使ってサーバーを止める
+
+セットアップが完了したら、イベント開始までインスタンスを停止しておくことができます。  
+停止中も S3 バケットに登録した error.html ページに Sorry 遷移し、継続してイベントを告知できます。
+
+- `aws sts get-caller-identity` コマンドを利用して、対象のアカウントと認証に差異がないことを確認する
+- `./rocket.sh stop` を実行する
+
+イベントを開始する場合は、start を実行してください。
+
+- `./rocket.sh start` を実行する
+
+`stop` を実行すると、メンテナンス状態になります。  
+
+- EC2 インスタンスを停止する
+- CloudFront に `/*` ビヘイビア（S3 オリジン `errorpage-s3-origin`）が追加される
+- このビヘイビアの **viewer-request に CloudFront Function がアソシエーション** される
+- Cloud Function は、**あらゆる URI を `/error.html` に書き換える**
+- 結果、`/` だけでなく `/channel/general` のような任意パスでも準備中ページに遷移する
+- S3 の静的コンテンツを配信するため EC2 が停止していてもページが表示される
+
+> なぜ Function が要るのか: キャッシュビヘイビアは「どのオリジンへ送るか」を決めるだけで URI は書き換えません。また `DefaultRootObject` は `/` へのリクエストにしか効かず、`/channel/general` のようなサブパスには適用されません（AWS 公式ドキュメントでも明記）。そのため以前の「`/*` を S3 へ向け + `DefaultRootObject=error.html`」という構成では、任意パスが S3 の存在しないオブジェクトを取りに行ってエラーになり得ました。viewer-request Function で URI を `/error.html` に書き換えることで、どのパスでも確実に準備中ページを返します。
+
+> `502/503/504` のカスタムエラーレスポンス（S3 の `error.html` を `200` で返す）は**バックストップ**として残しています。`/*` の切り替えが主、エラーレスポンスは保険、という二段構えです。
+
+## ⚠️ 重要: アプリを再デプロイするとカスタムドメインが外れる
+
+[オプション] のカスタムドメインを設定した場合、`03-app.yaml` のテンプレートを再実行すると、CloudFormation が「テンプレートに無い設定＝不要」と判断して、手動で足した **代替ドメイン名と証明書を削除**します。結果、設定した独自ドメインにアクセスできなくなります。
 
 **対策（どちらか）:**
 
@@ -220,68 +304,6 @@ aws cloudformation describe-stacks \
 - **(非推奨) テンプレートを再 deploy しない** — 以降の変更も全部コンソールで手動対応する。IaC から外れるので管理が煩雑になる。
 
 > 現状、S3 エラーページ（下記）を反映するには 03 の再 deploy が必要です。**先に上記の `Aliases` / `ViewerCertificate` をテンプレートへ取り込んでから** deploy してください。
-
----
-
-## 停止中の「準備中」ページ（S3 + CloudFront Function）
-
-当日までインスタンスを**停止**しておく運用のための仕組みです。メンテ中は `rocket.sh stop` が CloudFront に `/*` ビヘイビア（S3 オリジン `errorpage-s3-origin`）を追加し、そこへ **viewer-request の CloudFront Function** を関連付けます。この Function が**あらゆる URI を `/error.html` に書き換える**ので、`/` だけでなく `/channel/general` のような任意パスでも準備中ページが出ます。S3 配信なので EC2 が止まっていても表示できます。
-
-> なぜ Function が要るのか: キャッシュビヘイビアは「どのオリジンへ送るか」を決めるだけで URI は書き換えません。また `DefaultRootObject` は `/` へのリクエストにしか効かず、`/channel/general` のようなサブパスには適用されません（AWS 公式ドキュメントでも明記）。そのため以前の「`/*` を S3 へ向け + `DefaultRootObject=error.html`」という構成では、任意パスが S3 の存在しないオブジェクトを取りに行ってエラーになり得ました。viewer-request Function で URI を `/error.html` に書き換えることで、どのパスでも確実に準備中ページを返します。
-
-Function は `03-app.yaml` に `AWS::CloudFront::Function`（論理 ID `MaintenanceRewriteFunction`）として定義され、その ARN をスタック出力 `MaintenanceFunctionArn` で公開します。`rocket.sh stop` はこの出力を読み、`/*` ビヘイビアに関連付けます。S3 まわりの構成（S3 バケット + OAC + バケットポリシー + セカンドオリジン + `/error.html` のキャッシュビヘイビア）も `03-app.yaml` に含まれています。
-
-> `502/503/504` のカスタムエラーレスポンス（S3 の `error.html` を `200` で返す）は**バックストップ**として残しています。`/*` の切り替えが主、エラーレスポンスは保険、という二段構えです。
-
-**セットアップ手順:**
-
-1. 03 を deploy（上の「⚠️ 重要」を踏まえて、先に `Aliases`/`ViewerCertificate` を取り込んでから）。S3 バケットが作られる。
-
-2. バケット名を取得してアップロード:
-
-   ```bash
-   BUCKET=$(aws cloudformation describe-stacks --region us-east-1 \
-     --stack-name ephemeral-rocketchat-app \
-     --query "Stacks[0].Outputs[?OutputKey=='ErrorPageBucketName'].OutputValue" --output text)
-
-   aws s3 cp error.html "s3://$BUCKET/error.html" \
-     --content-type "text/html; charset=utf-8"
-   ```
-
-3. 動作確認: `./rocket.sh stop` を実行 → `https://chat.example.com/` でも `.../channel/general` でも準備中ページが出る。
-
-### 当日の停止 / 再開
-
-EC2 の停止/開始と CloudFront の切り替えをまとめて行う `rocket.sh` を使います（`aws ec2 stop/start` を手で叩く必要はありません）。対象リソースはスタック出力から自動解決します。
-
-```bash
-# 停止（EC2 停止 + /* ビヘイビア追加 → 準備中ページが全パスで出るようになる）
-./rocket.sh stop
-
-# 当日に再開（EC2 開始 + /* ビヘイビア削除 + 旧構成の DefaultRootObject クリア）
-./rocket.sh start
-```
-
-> 前提: `rocket.sh stop` は CloudFront Function の ARN をスタック出力 `MaintenanceFunctionArn` から読むため、**更新版の `03-app.yaml` を先に deploy**しておく必要があります（Function が未作成だと stop は中断します）。
-> `rocket.sh` は `aws` CLI と `jq` に依存します。環境変数 `REGION` / `STACK_NAME` で上書き可能です。
-> CloudFront の反映には数分かかります。再開後、通常画面に戻るのも同様です。
-> インスタンスを再開すると Docker コンテナは `restart: unless-stopped` で自動復帰します。
-> 注意: 停止/再開でプライベート IP は変わりませんが、停止中は EICE 経由の SSH もできません（起動中のみ）。
-> `rocket.sh` は冪等です。既にメンテ中に `stop` を、通常時に `start` を実行しても害はありません。
-
----
-
-## NAT を落としてコストを止める
-
-Docker イメージの取得が終わっていれば、NAT スタックを削除して NAT 課金を止められます。EC2・CloudFront はそのまま動き続けます（プライベートサブネットからの外向き通信だけが止まる）。
-
-```bash
-aws cloudformation delete-stack --region us-east-1 --stack-name ephemeral-rocketchat-nat
-```
-
-> 注意: NAT を落とすと Rocket.Chat の外向き通信（cloud.rocket.chat 登録、モバイルプッシュ通知ゲートウェイ、外部URLプレビューなど）は使えなくなります。チャット自体のデモには影響しません。再び必要になったら `02-nat.yaml` を再デプロイすればルートが復活します。
-
----
 
 ## 後片付け（イベント終了後）
 
@@ -327,6 +349,3 @@ aws cloudformation delete-stack --region us-east-1 --stack-name ephemeral-rocket
   ```
 - 検証コマンド: `cfn-lint -r us-east-1 -i W1030 -- 01-network.yaml 02-nat.yaml 03-app.yaml`
   （`W1030` は cfn-lint の内蔵スペックが新しい `t8i` を未収録なだけの誤検知。EC2 API で実在を確認済み。）
-
----
-

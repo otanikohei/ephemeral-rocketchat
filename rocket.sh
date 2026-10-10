@@ -68,7 +68,6 @@ update_distribution() {
   local func_arn="${2:-}"
   local tmp etag new_config
   tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
 
   aws cloudfront get-distribution-config \
     --region "$REGION" --id "$DIST_ID" --output json > "$tmp"
@@ -79,6 +78,7 @@ update_distribution() {
   # 変更が無ければ update をスキップ(冪等)。
   if [ "$(jq -cS '.DistributionConfig' "$tmp")" = "$(printf '%s' "$new_config" | jq -cS '.')" ]; then
     log "  CloudFront の設定に変更はありません(スキップ)。"
+    rm -f "$tmp"
     return 0
   fi
 
@@ -86,6 +86,7 @@ update_distribution() {
     --region "$REGION" --id "$DIST_ID" --if-match "$etag" \
     --distribution-config "$new_config" >/dev/null
   log "  CloudFront を更新しました(反映まで数分かかります)。"
+  rm -f "$tmp"
 }
 
 # --- stop -------------------------------------------------------------------
